@@ -133,6 +133,22 @@ function extractTitle(
   return "Untitled";
 }
 
+function cleanAuthorText(raw: string): string {
+  // Strip CSS rules that sometimes get scraped alongside author names
+  let text = raw.replace(/\{[^}]*\}/g, "");
+  // Strip remaining CSS selectors (e.g. .class_name, @media...)
+  text = text.replace(/\.[a-zA-Z_][\w-]*(?:\s*,\s*\.[a-zA-Z_][\w-]*)*/g, "");
+  text = text.replace(/@media[^{]*$/g, "");
+  // Strip stray CSS-like tokens
+  text = text.replace(/!important/g, "");
+  // Collapse whitespace
+  text = text.replace(/\s+/g, " ").trim();
+  // Extract "By Author Name" if present
+  const byMatch = text.match(/(?:^|[\s])By\s+([A-Z][a-zA-Z\s.'-]+)/);
+  if (byMatch) return byMatch[1].trim();
+  return text.replace(/^by\s+/i, "").trim();
+}
+
 function extractAuthor(
   $: cheerio.CheerioAPI,
   jsonLd: Record<string, unknown> | null
@@ -147,10 +163,11 @@ function extractAuthor(
   }
   const metaAuthor = $('meta[name="author"]').attr("content");
   if (metaAuthor) return metaAuthor;
-  const byline = $('[class*="byline"], [class*="author"], [rel="author"]')
-    .first()
-    .text();
-  if (byline) return byline.replace(/^by\s+/i, "").trim();
+  // Remove style tags before extracting byline to avoid CSS pollution
+  const bylineEl = $('[class*="byline"], [class*="author"], [rel="author"]').first();
+  bylineEl.find("style, script").remove();
+  const byline = bylineEl.text();
+  if (byline) return cleanAuthorText(byline);
   return "Unknown";
 }
 
@@ -168,6 +185,28 @@ function extractDate(
   return "";
 }
 
+const BOILERPLATE_PATTERNS = [
+  /subscribe|subscription|newsletter/i,
+  /sign\s*up|sign\s*in|log\s*in/i,
+  /terms\s+of\s+service|privacy\s+policy/i,
+  /cookie|consent/i,
+  /click(ing)?\s+(here|submit|below)/i,
+  /opt\s*out|unsubscribe/i,
+  /all\s+rights\s+reserved/i,
+  /©\s*\d{4}/,
+  /share\s+(this|on|via)/i,
+  /follow\s+us/i,
+  /related\s+(articles?|stories|posts)/i,
+  /read\s+more|continue\s+reading/i,
+  /advertisement|sponsored/i,
+  /you\s+(may|might)\s+also\s+like/i,
+  /recommended\s+for\s+you/i,
+];
+
+function isBoilerplate(text: string): boolean {
+  return BOILERPLATE_PATTERNS.some((pattern) => pattern.test(text));
+}
+
 function extractBody($: cheerio.CheerioAPI): string[] {
   const paragraphs: string[] = [];
   const selectors = [
@@ -179,10 +218,19 @@ function extractBody($: cheerio.CheerioAPI): string[] {
     ".content p",
   ];
 
+  const seen = new Set<string>();
+  const addParagraph = (text: string) => {
+    if (!seen.has(text)) {
+      seen.add(text);
+      paragraphs.push(text);
+    }
+  };
+
   for (const sel of selectors) {
     $(sel).each((_, el) => {
+      if ($(el).closest("form, footer, nav, aside, [class*='signup'], [class*='newsletter'], [class*='sidebar'], [class*='related'], [class*='comment']").length > 0) return;
       const text = $(el).text().trim();
-      if (text.length > 30) paragraphs.push(text);
+      if (text.length > 30 && !isBoilerplate(text)) addParagraph(text);
     });
     if (paragraphs.length > 3) break;
   }
@@ -190,9 +238,11 @@ function extractBody($: cheerio.CheerioAPI): string[] {
   // Fallback: just grab all p tags
   if (paragraphs.length <= 3) {
     paragraphs.length = 0;
+    seen.clear();
     $("p").each((_, el) => {
+      if ($(el).closest("form, footer, nav, aside, [class*='signup'], [class*='newsletter'], [class*='sidebar'], [class*='related'], [class*='comment']").length > 0) return;
       const text = $(el).text().trim();
-      if (text.length > 30) paragraphs.push(text);
+      if (text.length > 30 && !isBoilerplate(text)) addParagraph(text);
     });
   }
 
