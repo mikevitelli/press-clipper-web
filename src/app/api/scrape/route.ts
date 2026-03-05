@@ -41,6 +41,7 @@ async function fetchWithTimeout(
         Accept:
           "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate",
       },
       redirect: "follow",
     });
@@ -215,41 +216,126 @@ function isBoilerplate(text: string): boolean {
 
 function extractBody($: cheerio.CheerioAPI): string[] {
   const paragraphs: string[] = [];
-  const selectors = [
-    "article p",
-    '[class*="article-body"] p',
-    '[class*="post-content"] p',
-    '[class*="entry-content"] p',
-    "main p",
-    ".content p",
-  ];
+  // Check if a paragraph is inside a non-content container we should skip.
+  // Be careful: Squarespace puts classes like 'newsletter-style-dark' on <body>,
+  // and 'has-comments' on <article>, so broad class* selectors cause false positives.
+  // Only exclude specific container types, not body/article/main/section.
+  const SAFE_TAGS = new Set(["HTML", "BODY", "ARTICLE", "MAIN", "SECTION"]);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const isExcluded = (el: cheerio.Cheerio<any>): boolean => {
+    let node = el.parent();
+    while (node.length > 0) {
+      const tag = (node.prop("tagName") || "").toUpperCase();
+      if (SAFE_TAGS.has(tag)) { node = node.parent(); continue; }
+      const cls = (node.attr("class") || "").toLowerCase();
+      const nodeName = tag.toLowerCase();
+      if (nodeName === "form" || nodeName === "aside") return true;
+      if (nodeName === "footer" || nodeName === "nav") return true;
+      if (cls.includes("sidebar") || cls.includes("signup") || cls.includes("newsletter-form")) return true;
+      if (cls.includes("comment-list") || cls.includes("comments-section")) return true;
+      node = node.parent();
+    }
+    return false;
+  };
 
   const seen = new Set<string>();
   const addParagraph = (text: string) => {
+    // Skip if we already have a paragraph that contains this text (sub-paragraph)
+    // or if this text contains an existing paragraph (parent that includes child text)
+    for (const existing of seen) {
+      if (existing.includes(text) || text.includes(existing)) {
+        if (text.length > existing.length) {
+          // Replace the shorter one with the longer version
+          seen.delete(existing);
+          const idx = paragraphs.indexOf(existing);
+          if (idx !== -1) paragraphs.splice(idx, 1);
+          break;
+        }
+        return;
+      }
+    }
     if (!seen.has(text)) {
       seen.add(text);
       paragraphs.push(text);
     }
   };
 
-  for (const sel of selectors) {
+  // Phase 1: Try <p> tags inside article containers
+  const pSelectors = [
+    "article p",
+    '[class*="article-body"] p',
+    '[class*="post-content"] p',
+    '[class*="entry-content"] p',
+    '[class*="story-body"] p',
+    '[class*="article-content"] p',
+    '[class*="post-body"] p',
+    "main p",
+    ".content p",
+  ];
+
+  for (const sel of pSelectors) {
     $(sel).each((_, el) => {
-      if ($(el).closest("form, footer, nav, aside, [class*='signup'], [class*='newsletter'], [class*='sidebar'], [class*='related'], [class*='comment']").length > 0) return;
+      if (isExcluded($(el))) return;
       const text = $(el).text().trim();
       if (text.length > 30 && !isBoilerplate(text)) addParagraph(text);
     });
     if (paragraphs.length > 3) break;
   }
 
-  // Fallback: just grab all p tags
+  // Phase 2: Fallback — all <p> tags
   if (paragraphs.length <= 3) {
     paragraphs.length = 0;
     seen.clear();
     $("p").each((_, el) => {
-      if ($(el).closest("form, footer, nav, aside, [class*='signup'], [class*='newsletter'], [class*='sidebar'], [class*='related'], [class*='comment']").length > 0) return;
+      if (isExcluded($(el))) return;
       const text = $(el).text().trim();
       if (text.length > 30 && !isBoilerplate(text)) addParagraph(text);
     });
+  }
+
+  // Phase 3: Fallback — look for text in <div> elements (some sites don't use <p> tags)
+  if (paragraphs.length <= 1) {
+    const divSelectors = [
+      "article div",
+      '[class*="article-body"] div',
+      '[class*="post-content"] div',
+      '[class*="entry-content"] div',
+      '[class*="story-body"] div',
+      '[class*="article-content"] div',
+      "main div",
+    ];
+
+    for (const sel of divSelectors) {
+      $(sel).each((_, el) => {
+        if (isExcluded($(el))) return;
+        // Only grab leaf-ish divs (no nested block elements with substantial text)
+        const childBlocks = $(el).children("div, p, article, section, ul, ol");
+        if (childBlocks.length > 0) return;
+        const text = $(el).text().trim();
+        if (text.length > 30 && !isBoilerplate(text)) addParagraph(text);
+      });
+      if (paragraphs.length > 3) break;
+    }
+  }
+
+  // Phase 4: Last resort — extract text blocks from the main content area directly
+  if (paragraphs.length <= 1) {
+    const contentEl = $("article, main, [class*='article'], [class*='content'], [role='main']").first();
+    if (contentEl.length) {
+      // Remove non-content elements
+      const clone = contentEl.clone();
+      clone.find("script, style, nav, footer, aside, header, form, iframe, [class*='sidebar'], [class*='comment'], [class*='related'], [class*='newsletter'], [class*='signup']").remove();
+      const fullText = clone.text();
+      // Split into paragraphs by double newlines or significant whitespace gaps
+      const chunks = fullText.split(/\n\s*\n/).map(s => s.replace(/\s+/g, " ").trim()).filter(s => s.length > 30 && !isBoilerplate(s));
+      if (chunks.length > paragraphs.length) {
+        paragraphs.length = 0;
+        seen.clear();
+        for (const chunk of chunks) {
+          addParagraph(chunk);
+        }
+      }
+    }
   }
 
   return paragraphs;
