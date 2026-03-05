@@ -32,6 +32,45 @@ function base64ToUint8Array(base64: string): Uint8Array {
   return bytes;
 }
 
+function mimeToDocxType(mime: string | null): "png" | "jpg" | "gif" | "bmp" {
+  if (!mime) return "png";
+  if (mime.includes("jpeg") || mime.includes("jpg")) return "jpg";
+  if (mime.includes("gif")) return "gif";
+  if (mime.includes("bmp")) return "bmp";
+  // PNG is the safest default — webp gets converted by most viewers
+  return "png";
+}
+
+function getImageDimensions(base64: string): { width: number; height: number } | null {
+  try {
+    const bytes = base64ToUint8Array(base64);
+    // PNG: width/height at bytes 16-23 in IHDR
+    if (bytes[0] === 0x89 && bytes[1] === 0x50) {
+      const width = (bytes[16] << 24) | (bytes[17] << 16) | (bytes[18] << 8) | bytes[19];
+      const height = (bytes[20] << 24) | (bytes[21] << 16) | (bytes[22] << 8) | bytes[23];
+      if (width > 0 && height > 0) return { width, height };
+    }
+    // JPEG: scan for SOF0/SOF2 markers
+    if (bytes[0] === 0xff && bytes[1] === 0xd8) {
+      let offset = 2;
+      while (offset < bytes.length - 8) {
+        if (bytes[offset] !== 0xff) break;
+        const marker = bytes[offset + 1];
+        if (marker === 0xc0 || marker === 0xc2) {
+          const height = (bytes[offset + 5] << 8) | bytes[offset + 6];
+          const width = (bytes[offset + 7] << 8) | bytes[offset + 8];
+          if (width > 0 && height > 0) return { width, height };
+        }
+        const len = (bytes[offset + 2] << 8) | bytes[offset + 3];
+        offset += 2 + len;
+      }
+    }
+  } catch {
+    // fall through
+  }
+  return null;
+}
+
 function formatDate(dateStr: string): string {
   if (!dateStr) return "";
   try {
@@ -50,17 +89,27 @@ function formatDate(dateStr: string): string {
 function buildClipParagraphs(data: ClipData): Paragraph[] {
   const paragraphs: Paragraph[] = [];
 
-  // Logo
+  // Logo — scale to fit ~200px wide, preserve aspect ratio
   if (data.logoBase64) {
     try {
+      const dims = getImageDimensions(data.logoBase64);
+      let logoW = 200;
+      let logoH = 60;
+      if (dims && dims.width > 0 && dims.height > 0) {
+        const maxWidth = 250;
+        const maxHeight = 80;
+        const scale = Math.min(maxWidth / dims.width, maxHeight / dims.height, 1);
+        logoW = Math.round(dims.width * scale);
+        logoH = Math.round(dims.height * scale);
+      }
       paragraphs.push(
         new Paragraph({
           alignment: AlignmentType.CENTER,
           children: [
             new ImageRun({
               data: base64ToUint8Array(data.logoBase64),
-              transformation: { width: 180, height: 60 },
-              type: "png",
+              transformation: { width: logoW, height: logoH },
+              type: mimeToDocxType(data.logoType),
             }),
           ],
         })
@@ -122,17 +171,26 @@ function buildClipParagraphs(data: ClipData): Paragraph[] {
     paragraphs.push(new Paragraph({ text: "" }));
   }
 
-  // Hero image
+  // Hero image — scale to max 580px wide, preserve aspect ratio
   if (data.heroImageBase64) {
     try {
+      const dims = getImageDimensions(data.heroImageBase64);
+      let heroW = 580;
+      let heroH = 380;
+      if (dims && dims.width > 0 && dims.height > 0) {
+        const maxWidth = 580;
+        const scale = Math.min(maxWidth / dims.width, 1);
+        heroW = Math.round(dims.width * scale);
+        heroH = Math.round(dims.height * scale);
+      }
       paragraphs.push(
         new Paragraph({
           alignment: AlignmentType.CENTER,
           children: [
             new ImageRun({
               data: base64ToUint8Array(data.heroImageBase64),
-              transformation: { width: 580, height: 380 },
-              type: "png",
+              transformation: { width: heroW, height: heroH },
+              type: mimeToDocxType(data.heroImageType),
             }),
           ],
         })

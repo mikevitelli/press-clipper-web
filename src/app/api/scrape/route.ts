@@ -53,16 +53,22 @@ async function fetchWithTimeout(
 }
 
 async function downloadImageAsBase64(
-  url: string
+  url: string,
+  minBytes = 2000
 ): Promise<{ base64: string; mime: string } | null> {
   try {
+    // Skip SVG URLs — they can't be embedded as raster in docx
+    if (url.endsWith(".svg") || url.includes(".svg?")) return null;
+
     const res = await fetchWithTimeout(url, 10000);
     if (!res.ok) return null;
     const buffer = await res.arrayBuffer();
     const bytes = new Uint8Array(buffer);
-    if (bytes.length < 100) return null;
+    if (bytes.length < minBytes) return null;
 
     let mime = res.headers.get("content-type") || "image/jpeg";
+    // Skip SVG responses
+    if (mime.includes("svg")) return null;
     // Detect from magic bytes
     if (bytes[0] === 0x89 && bytes[1] === 0x50) mime = "image/png";
     else if (bytes[0] === 0xff && bytes[1] === 0xd8) mime = "image/jpeg";
@@ -272,11 +278,11 @@ function extractLogo(
   $: cheerio.CheerioAPI,
   baseUrl: string
 ): string | null {
-  // Check header for logo
+  // Check header for logo — prefer actual logo images over favicons
   const headerImgs = $("header img, nav img, [class*='logo'] img");
   for (let i = 0; i < headerImgs.length; i++) {
     const src = $(headerImgs[i]).attr("src");
-    if (src) {
+    if (src && !src.endsWith(".svg") && !src.includes(".svg?")) {
       const alt = ($(headerImgs[i]).attr("alt") || "").toLowerCase();
       const className = ($(headerImgs[i]).attr("class") || "").toLowerCase();
       if (
@@ -288,16 +294,20 @@ function extractLogo(
       }
     }
   }
-  // Check for any img with logo in src/alt
-  const anyLogo = $('img[src*="logo"], img[alt*="logo"]').first().attr("src");
-  if (anyLogo) return new URL(anyLogo, baseUrl).href;
+  // Check for any img with logo in src/alt (skip SVGs)
+  const logoImgs = $('img[src*="logo"], img[alt*="logo"]');
+  for (let i = 0; i < logoImgs.length; i++) {
+    const src = $(logoImgs[i]).attr("src");
+    if (src && !src.endsWith(".svg") && !src.includes(".svg?")) {
+      return new URL(src, baseUrl).href;
+    }
+  }
 
-  // Fallback to favicon
-  const favicon =
-    $('link[rel="icon"]').attr("href") ||
-    $('link[rel="shortcut icon"]').attr("href");
-  if (favicon) return new URL(favicon, baseUrl).href;
+  // Try apple-touch-icon (higher quality than favicon, typically 180x180+)
+  const touchIcon = $('link[rel="apple-touch-icon"]').attr("href");
+  if (touchIcon) return new URL(touchIcon, baseUrl).href;
 
+  // No favicon fallback — favicons are too small for print docs
   return null;
 }
 
@@ -367,10 +377,10 @@ export async function POST(request: NextRequest) {
     const heroImageUrl = extractHeroImage($, jsonLd);
     const logoUrl = extractLogo($, url);
 
-    // Download images in parallel
+    // Download images in parallel (hero needs 5KB+, logo needs 2KB+)
     const [heroData, logoData] = await Promise.all([
-      heroImageUrl ? downloadImageAsBase64(heroImageUrl) : null,
-      logoUrl ? downloadImageAsBase64(logoUrl) : null,
+      heroImageUrl ? downloadImageAsBase64(heroImageUrl, 5000) : null,
+      logoUrl ? downloadImageAsBase64(logoUrl, 2000) : null,
     ]);
 
     const article: ScrapedArticle = {
